@@ -31,7 +31,7 @@ class TransformerASR(nn.Module):
             [nn.TransformerDecoderLayer(self.d,6) for _ in range(decoder_layers)]
         )
 
-        self.output = nn.Linear(self.d,output_len)
+        self.output = nn.Linear(self.d,output_len + 1)
         self.ctc_output = nn.linear(self.d,output_len + 1)
 
     def _flatten(self,data):
@@ -43,6 +43,15 @@ class TransformerASR(nn.Module):
 
     def forward(self,src_data,tgt_data,use_stepwise=False):
         data = src_data
+
+        data, ctc_out = self.encode(data)
+
+        data = self.decode(data,tgt_data,use_stepwise)
+
+        return data,ctc_out
+
+    def encode(self,in_data):
+        data = in_data
         for cnn in self.cnn_layers:
             data = cnn(data)
             data = relu(data)
@@ -67,17 +76,21 @@ class TransformerASR(nn.Module):
 
         ctc_out = self.ctc_output(data)
         ctc_out = softmax(ctc_out)
+        return data, ctc_out
 
-        padding_mask = triu(ones(tgt_data.size(0),tgt_data.size(0)),diagonal=1)
+    def decode(self,src_data,tgt_data,use_stepwise=False):
+        data = src_data
+        if use_stepwise:
+            padding_mask = triu(ones(tgt_data.size(0),tgt_data.size(0)),diagonal=1)
 
         for dec in decoder_layers:
-            data = dec(data, tgt_mask=padding_mask)
+            data = dec(tgt_data, data, tgt_mask=(padding_mask if use_stepwise else None))
 
         data = self.output(data)
 
         data = softmax(data)
 
-        return data,ctc_out
+        return data
 
     def _pos_embed(data):
         embed_dim = data.size(-1)
