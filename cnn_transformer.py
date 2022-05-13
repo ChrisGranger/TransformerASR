@@ -1,38 +1,33 @@
-from turtle import forward
+import torch
 from torch import *
 from torch import nn
+import numpy as np
+import torch.nn.functional as F
 
 class TransformerASR(nn.Module):
 
-    def __init__(self, num_feats, output_len, cnn_layers=2, encoder_layers=2,decoder_layers=1):
+    def __init__(self, num_feats, output_len, d_attn=256, cnn_layers=2, encoder_layers=1,decoder_layers=1,use_downsample=False):
+        super(TransformerASR,self).__init__()
         self.features = num_feats
-
         self.cnn_layers = nn.ModuleList(
-            [nn.Conv2d(1,256,3,stride=2,padding=1)] + [nn.Conv2d(256,256,3,stride=2,padding=1) for _ in range(cnn_layers - 1)]
+            [nn.Conv2d(1,256,3,stride=2,padding=1)] + [nn.Conv2d(256,256,3,stride=2,padding=1) for _ in np.arange(cnn_layers - 1)]
         )
-
-        self.cnn_features = int((self.features - 1)/2 + 1)
-
-        if self.cnn_features % 4 == 0:
-            self.pool_pad = 0
-        else:
-            self.pool_pad = 4 - (self.cnn_features % 4)
-
-        self.pooling_layer = nn.MaxPool2d([1,4],padding=self.pool_pad)
-        self.pooling_features = int((self.cnn_features + 2*self.pool_pad - 4)/4 + 1)
-        self.d = self.pooling_features * 256
+        self.downsample = use_downsample
+        self.cnn_features = int(self.features/(2 * cnn_layers)) * 256
+        self.d_attn = d_attn
+        self.dim_reduce = nn.Linear(self.cnn_features, self.d_attn)
         self.encoder_layers = nn.ModuleList(
-            [nn.TransformerEncoderLayer(self.d, 8) for _ in range(encoder_layers)]
+            [nn.TransformerEncoderLayer(self.d_attn, 8) for _ in np.arange(encoder_layers)]
         )
 
-        self.time_reduction = nn.Linear(self.d * 2, self.d)
+        self.time_reduction = nn.Linear(self.d_attn * 2, self.d_attn)
 
         self.decoder_layers = nn.ModuleList(
-            [nn.TransformerDecoderLayer(self.d,6) for _ in range(decoder_layers)]
+            [nn.TransformerDecoderLayer(self.d_attn,8) for _ in np.arange(decoder_layers)]
         )
-
-        self.output = nn.Linear(self.d,output_len + 1)
-        self.ctc_output = nn.linear(self.d,output_len + 1)
+        self.decoder_embed = nn.Embedding(output_len + 2,self.d_attn,padding_idx=output_len + 1)
+        self.output = nn.Linear(self.d_attn,output_len + 1)
+        self.ctc_output = nn.Linear(self.d_attn,output_len + 1)
 
     def _flatten(self,data):
         #[batch_size,num_filters,seq,num_features]
@@ -52,47 +47,48 @@ class TransformerASR(nn.Module):
 
     def encode(self,in_data):
         data = in_data
+        data = data.unsqueeze(1)
         for cnn in self.cnn_layers:
             data = cnn(data)
             data = relu(data)
-        
-        data = self.pooling_layer(data)
 
         data = self._flatten(data)
-
+        data = self.dim_reduce(data)
         data = self._pos_embed(data)
-
         data = self.encoder_layers[0](data)
+        if self.downsample:
+            d_size = data.size()
+            if d_size[0] % 2 != 0:
+                data = F.pad(data,(0,0,0,0,0,1))
+                d_size = data.size()
+            data = data.transpose(0,1).reshape(int(d_size[0]/2),d_size[1],d_size[2]*2)
+            data = self.time_reduction(data)
 
-        d_size = data.size()
-        data = data.transpose(0,1).reshape(d_size[1],d_size[0]/2,d_size[2]*2)
+            data = tanh(data)
 
-        data = self.time_reduction(data)
-
-        data = tanh(data)
-
-        for x in range(1,len(self.encoder_layers)):
+        for x in np.arange(1,len(self.encoder_layers)):
             data = self.encoder_layers[x](data)
 
         ctc_out = self.ctc_output(data)
-        ctc_out = softmax(ctc_out)
+        ctc_out = softmax(ctc_out,-1,torch.float64)
         return data, ctc_out
 
-    def decode(self,src_data,tgt_data,use_stepwise=False):
-        data = src_data
-        if use_stepwise:
+    def decode(self,encoder_data,tgt_data,use_stepwise=False):
+        data = encoder_data
+        padding_mask=None
+        tgt_data = tgt_data.transpose(0,1)
+        tgt_data = self.decoder_embed(tgt_data)
+        if not use_stepwise:
             padding_mask = triu(ones(tgt_data.size(0),tgt_data.size(0)),diagonal=1)
-
-        for dec in decoder_layers:
-            data = dec(tgt_data, data, tgt_mask=(padding_mask if use_stepwise else None))
+        for dec in self.decoder_layers:
+            data = dec(tgt_data, data, tgt_mask=padding_mask)
 
         data = self.output(data)
 
-        data = softmax(data)
-
+        data = F.softmax(data,-1,torch.float64)
         return data
 
-    def _pos_embed(data):
+    def _pos_embed(self,data):
         embed_dim = data.size(-1)
         seq_length = data.size(0)
 
@@ -104,9 +100,13 @@ class TransformerASR(nn.Module):
                     temp.append(sin(x/(10000**(y/embed_dim))))
                 else:
                     temp.append(cos(x/(10000**((y-1)/embed_dim))))
-        pos_encodings = FloatTensor(pos_encodings)
-        with torch.no_grad():
+            temp = stack(temp)
+            pos_encodings.append(temp)
+        pos_encodings = stack(pos_encodings)
+        data = data.transpose(0,1)
+        with no_grad():
             data = data + pos_encodings
+        data = data.transpose(0,1)
         return data
 
         
